@@ -151,6 +151,8 @@ jobs:
       - name: LLVM para o console
         run: |
           Set-Location "$env:RELEASE\rpcs3-ps4"
+          # prepare-llvm.py grava aqui e nao cria a pasta (no repositorio ela nao existe: o git nao guarda pastas vazias)
+          New-Item -ItemType Directory -Force ps4-port/.build-native-package | Out-Null
           ./ps4-port/build-llvm.ps1 -Sdk $env:SDK -CompilerBin $env:LLVM -Jobs ([Environment]::ProcessorCount) *>&1 | Tee-Object -FilePath "$env:RELEASE\logs\1-llvm.log"
 
       - name: Configurar e compilar o ELF
