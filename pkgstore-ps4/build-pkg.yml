@@ -1,0 +1,187 @@
+# Compila o RPCS3 PORT FOR PS4 (com a PKG Store) num runner Windows do GitHub e entrega o .pkg como artefato.
+# Siga o passo a passo em COMO-COMPILAR-NA-NUVEM.md. Rode em: Actions > "Build PKG" > Run workflow.
+name: Build PKG
+
+on:
+  workflow_dispatch:
+    inputs:
+      apply_pkgstore:
+        description: "Aplicar o patch da PKG Store (desmarque para testar o build original, sem ele)"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 355
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      GH_TOKEN: ${{ github.token }}
+      APPLY_PKGSTORE: ${{ inputs.apply_pkgstore }}
+    steps:
+      - name: Git sem conversão de fim de linha
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.eol lf
+          git config --global core.longpaths true
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Informações da máquina
+        run: |
+          "CPUs: $([Environment]::ProcessorCount)"
+          Get-PSDrive -PSProvider FileSystem | Format-Table Name, @{n='LivreGB';e={[math]::Round($_.Free/1GB,1)}} -AutoSize | Out-String
+          cmake --version
+          python --version
+          git --version
+
+      - name: Montar a pasta do build (rpcs3-ps4 e orbis-compat lado a lado)
+        run: |
+          $release = 'C:\release'
+          New-Item -ItemType Directory -Force -Path $release, "$release\logs" | Out-Null
+          foreach ($dir in 'rpcs3-ps4', 'orbis-compat') {
+            robocopy "$env:GITHUB_WORKSPACE\$dir" "$release\$dir" /E /NFL /NDL /NJH /NJS /NP /MT:8 | Out-Null
+            if ($LASTEXITCODE -ge 8) { throw "robocopy de $dir falhou ($LASTEXITCODE)" }
+          }
+          $global:LASTEXITCODE = 0
+          "RELEASE=$release" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Registrar o pin do LLVM (passo 3 do BUILDING.md)
+        run: |
+          $rp = "$env:RELEASE\rpcs3-ps4"
+          git -C $rp init -q
+          if ($LASTEXITCODE) { throw 'git init falhou' }
+          git -C $rp update-index --add --cacheinfo "160000,ca7933e47d3a3451d81e72ac174dcb5aa28b59d1,3rdparty/llvm/llvm"
+          if ($LASTEXITCODE) { throw 'git update-index falhou' }
+          git -C $rp -c user.name=ci -c user.email=ci@localhost commit -q -m "Record RPCS3's LLVM submodule pin"
+          if ($LASTEXITCODE) { throw 'git commit falhou' }
+
+      - name: Aplicar a PKG Store
+        if: env.APPLY_PKGSTORE == 'true'
+        run: |
+          $rp = "$env:RELEASE\rpcs3-ps4"
+          $kit = "$env:GITHUB_WORKSPACE\pkgstore-ps4"
+          if (-not (Test-Path "$kit\pkgstore_launcher.patch")) { throw 'Falta a pasta pkgstore-ps4 na raiz do fork (veja COMO-COMPILAR-NA-NUVEM.md).' }
+          Copy-Item "$kit\util\ps4_pkgstore.hpp", "$kit\util\ps4_pkgstore_http.hpp" -Destination "$rp\rpcs3\util\"
+          git -C $rp apply --verbose "$kit\pkgstore_launcher.patch"
+          if ($LASTEXITCODE) { throw 'O patch da PKG Store não aplicou limpo.' }
+          if (-not (Select-String -Path "$rp\rpcs3\ps4_launcher.cpp" -Pattern 'pkgui::store' -Quiet)) { throw 'Patch aplicado, mas a PKG Store não está no launcher.' }
+          'PKG Store aplicada.'
+
+      - name: Baixar OpenOrbis, llvm-mingw, orbis-porting-kit, Mesa e Ninja
+        run: |
+          $release = $env:RELEASE
+          $tools = 'C:\tools'
+          New-Item -ItemType Directory -Force -Path "$tools\oo\x", "$tools\llvm", "$tools\ninja", "$release\orbis-mesa-bundle\tmp" | Out-Null
+
+          # OpenOrbis PS4 Toolchain v0.5.4: pega o .zip do release (ou o .tar.gz) e acha a raiz pelo link.x
+          $assets = gh release view v0.5.4 --repo OpenOrbis/OpenOrbis-PS4-Toolchain --json assets --jq '.assets[].name'
+          if ($LASTEXITCODE) { throw 'Não consegui listar o release v0.5.4 do OpenOrbis.' }
+          "Assets do OpenOrbis v0.5.4: $($assets -join ', ')"
+          $pick = $assets | Where-Object { $_ -like '*.zip' } | Select-Object -First 1
+          if (-not $pick) { $pick = $assets | Where-Object { $_ -like '*.tar.gz' } | Select-Object -First 1 }
+          if (-not $pick) { throw 'O release v0.5.4 do OpenOrbis não tem .zip nem .tar.gz.' }
+          gh release download v0.5.4 --repo OpenOrbis/OpenOrbis-PS4-Toolchain --dir "$tools\oo" --pattern $pick
+          if ($LASTEXITCODE) { throw 'Download do OpenOrbis falhou.' }
+          if ($pick -like '*.zip') {
+            Expand-Archive -Path "$tools\oo\$pick" -DestinationPath "$tools\oo\x" -Force
+          } else {
+            tar -xzf "$tools\oo\$pick" -C "$tools\oo\x"
+            if ($LASTEXITCODE) { Write-Warning 'tar do OpenOrbis terminou com avisos.' }
+          }
+          $link = Get-ChildItem "$tools\oo\x" -Recurse -Filter link.x | Where-Object { Test-Path (Join-Path $_.DirectoryName 'include/orbis') } | Select-Object -First 1
+          if (-not $link) { throw 'Não achei a raiz do OpenOrbis (link.x com include/orbis).' }
+          $sdk = $link.DirectoryName.Replace('\', '/')
+          foreach ($need in 'lib/libc++.a', 'bin/windows/create-fself.exe', 'bin/windows/create-gp4.exe', 'bin/windows/PkgTool.Core.exe') {
+            if (-not (Test-Path "$sdk/$need")) { throw "OpenOrbis incompleto: falta $need em $sdk" }
+          }
+          "SDK=$sdk" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "OpenOrbis em $sdk"
+
+          # llvm-mingw 20240619 (UCRT, x86_64)
+          gh release download 20240619 --repo mstorsjo/llvm-mingw --dir "$tools\llvm" --pattern 'llvm-mingw-20240619-ucrt-x86_64.zip'
+          if ($LASTEXITCODE) { throw 'Download do llvm-mingw falhou.' }
+          Expand-Archive -Path "$tools\llvm\llvm-mingw-20240619-ucrt-x86_64.zip" -DestinationPath "$tools\llvm" -Force
+          $llvm = "C:/tools/llvm/llvm-mingw-20240619-ucrt-x86_64/bin"
+          if (-not (Test-Path "$llvm/clang++.exe")) { throw "llvm-mingw incompleto em $llvm" }
+          "LLVM=$llvm" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+          # Ninja
+          gh release download v1.12.1 --repo ninja-build/ninja --dir "$tools\ninja" --pattern 'ninja-win.zip'
+          if ($LASTEXITCODE) { throw 'Download do Ninja falhou.' }
+          Expand-Archive -Path "$tools\ninja\ninja-win.zip" -DestinationPath "$tools\ninja" -Force
+          New-Item -ItemType Directory -Force -Path "$release\rpcs3-ps4\ps4-port\.build-tools" | Out-Null
+          Copy-Item "$tools\ninja\ninja.exe" "$release\rpcs3-ps4\ps4-port\.build-tools\ninja.exe"
+
+          # orbis-porting-kit no commit fixado
+          git clone --filter=blob:none https://github.com/orbis-ports/orbis-porting-kit.git "$release\orbis-porting-kit"
+          if ($LASTEXITCODE) { throw 'Clone do orbis-porting-kit falhou.' }
+          git -C "$release\orbis-porting-kit" checkout 213b0c38ff25ea7ca402c8844a6494086d0f1cae
+          if ($LASTEXITCODE) { throw 'Checkout do orbis-porting-kit falhou.' }
+          if (Test-Path "$release\orbis-porting-kit\.gitmodules") { git -C "$release\orbis-porting-kit" submodule update --init --recursive }
+          if (-not (Test-Path "$release\orbis-porting-kit\vkloader")) { throw 'O orbis-porting-kit não tem a pasta vkloader.' }
+
+          # Mesa PS4 bundle
+          gh release download orbis-mesa-4c934ebf9cda --repo orbis-ports/mesa-ps4 --dir "$release\orbis-mesa-bundle" --pattern 'orbis-mesa-4c934ebf9cda.tar.gz'
+          if ($LASTEXITCODE) { throw 'Download do Mesa PS4 bundle falhou.' }
+          tar -xzf "$release\orbis-mesa-bundle\orbis-mesa-4c934ebf9cda.tar.gz" -C "$release\orbis-mesa-bundle\tmp"
+          if ($LASTEXITCODE) { Write-Warning 'tar do Mesa terminou com avisos (links simbólicos?).' }
+          $inner = @(Get-ChildItem "$release\orbis-mesa-bundle\tmp" -Directory)
+          $items = @(Get-ChildItem "$release\orbis-mesa-bundle\tmp")
+          $target = "$release\orbis-mesa-bundle\orbis-mesa-4c934ebf9cda"
+          if ($inner.Count -eq 1 -and $items.Count -eq 1) { Move-Item $inner[0].FullName $target } else { Move-Item "$release\orbis-mesa-bundle\tmp" $target }
+          if (-not (Test-Path $target)) { throw 'Não consegui montar orbis-mesa-bundle/orbis-mesa-4c934ebf9cda.' }
+          $global:LASTEXITCODE = 0
+
+      - name: Dependências (Abseil e GNU Make)
+        run: |
+          Set-Location "$env:RELEASE\rpcs3-ps4"
+          ./ps4-port/prepare-abseil.ps1
+          ./ps4-port/prepare-make.ps1
+
+      - name: LLVM para o console
+        run: |
+          Set-Location "$env:RELEASE\rpcs3-ps4"
+          ./ps4-port/build-llvm.ps1 -Sdk $env:SDK -CompilerBin $env:LLVM -Jobs ([Environment]::ProcessorCount) *>&1 | Tee-Object -FilePath "$env:RELEASE\logs\1-llvm.log"
+
+      - name: Configurar e compilar o ELF
+        run: |
+          Set-Location "$env:RELEASE\rpcs3-ps4"
+          cmake -S . -B ps4-port/.build-abi -G Ninja "-DCMAKE_MAKE_PROGRAM=$PWD/ps4-port/.build-tools/ninja.exe" -DRPCS3_PS4_PORT=ON -DCMAKE_TOOLCHAIN_FILE=ps4-port/toolchain.cmake "-DRPCS3_PS4_SDK=$env:SDK" "-DRPCS3_PS4_LLVM_BIN=$env:LLVM" -DRPCS3_PS4_WITH_LLVM=ON *>&1 | Tee-Object -FilePath "$env:RELEASE\logs\2-configure.log"
+          if ($LASTEXITCODE) { throw "cmake (configurar) falhou ($LASTEXITCODE)" }
+          cmake --build ps4-port/.build-abi --target rpcs3_ps4_elf -j ([Environment]::ProcessorCount) *>&1 | Tee-Object -FilePath "$env:RELEASE\logs\3-build.log"
+          if ($LASTEXITCODE) { throw "cmake (compilar) falhou ($LASTEXITCODE)" }
+
+      - name: Empacotar o PKG
+        run: |
+          Set-Location "$env:RELEASE\rpcs3-ps4"
+          $version = [regex]::Match((Get-Content rpcs3/util/ps4_build_version.hpp -Raw), 'ps4_build_version\[\]\s*=\s*"([0-9]+\.[0-9]{2})"').Groups[1].Value
+          if (-not $version) { throw 'Não achei a versão em ps4_build_version.hpp' }
+          ./ps4-port/package-native.ps1 -Sdk $env:SDK -LlvmTools $env:LLVM -Version $version *>&1 | Tee-Object -FilePath "$env:RELEASE\logs\4-package.log"
+          Get-ChildItem ps4-port/dist | Format-Table Name, Length -AutoSize | Out-String
+
+      - name: Guardar o PKG
+        uses: actions/upload-artifact@v4
+        with:
+          name: rpcs3-ps4-pkg
+          path: C:/release/rpcs3-ps4/ps4-port/dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Guardar os logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-do-build
+          path: C:/release/logs/*
+          if-no-files-found: ignore
+          retention-days: 14
