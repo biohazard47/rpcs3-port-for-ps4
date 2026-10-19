@@ -158,7 +158,7 @@ jobs:
       - name: Configurar e compilar o ELF
         run: |
           Set-Location "$env:RELEASE\rpcs3-ps4"
-          cmake -S . -B ps4-port/.build-abi -G Ninja "-DCMAKE_MAKE_PROGRAM=$PWD/ps4-port/.build-tools/ninja.exe" -DRPCS3_PS4_PORT=ON -DCMAKE_TOOLCHAIN_FILE=ps4-port/toolchain.cmake "-DRPCS3_PS4_SDK=$env:SDK" "-DRPCS3_PS4_LLVM_BIN=$env:LLVM" -DRPCS3_PS4_WITH_LLVM=ON *>&1 | Tee-Object -FilePath "$env:RELEASE\logs\2-configure.log"
+          cmake -S . -B ps4-port/.build-abi -G Ninja "-DCMAKE_MAKE_PROGRAM=$PWD/ps4-port/.build-tools/ninja.exe" -DRPCS3_PS4_PORT=ON "-DCMAKE_TOOLCHAIN_FILE=ps4-port/toolchain.cmake" "-DRPCS3_PS4_SDK=$env:SDK" "-DRPCS3_PS4_LLVM_BIN=$env:LLVM" -DRPCS3_PS4_WITH_LLVM=ON *>&1 | Tee-Object -FilePath "$env:RELEASE\logs\2-configure.log"
           if ($LASTEXITCODE) { throw "cmake (configurar) falhou ($LASTEXITCODE)" }
           cmake --build ps4-port/.build-abi --target rpcs3_ps4_elf -j ([Environment]::ProcessorCount) *>&1 | Tee-Object -FilePath "$env:RELEASE\logs\3-build.log"
           if ($LASTEXITCODE) { throw "cmake (compilar) falhou ($LASTEXITCODE)" }
